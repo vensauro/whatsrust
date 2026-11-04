@@ -16,9 +16,9 @@
 &nbsp;
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](LICENSE)
 &nbsp;
-[![54 API Endpoints](https://img.shields.io/badge/API-54_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
+[![58 API Endpoints](https://img.shields.io/badge/API-58_endpoints-green?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#api)
 &nbsp;
-[![30 MCP Tools](https://img.shields.io/badge/MCP-30_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
+[![33 MCP Tools](https://img.shields.io/badge/MCP-33_tools-blueviolet?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust#mcp-server-for-ai-agents)
 &nbsp;
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](https://github.com/199-biotechnologies/whatsrust/pulls)
 
@@ -47,12 +47,12 @@ We needed WhatsApp inside agent software and got tired of babysitting a Node sid
 | **Memory usage** | ~50-120 MB idle | **~15 MB** |
 | **Dependencies** | `npm install` + hope | `cargo build` |
 | **Crash recovery** | Roll your own | SQLite-backed queue + per-message backoff |
-| **API** | None built-in | **54 REST endpoints** + CLI + MCP server |
+| **API** | None built-in | **58 REST endpoints** + CLI + MCP server |
 | **Status/stories** | DIY | Text, image, video, revoke -- all built in |
 | **Chat management** | Manual API calls | **12 operations** (pin, mute, archive, star...) |
 | **Group management** | Manual | **12 methods**, full CRUD |
 | **Anti-ban protection** | None | Read receipt batching, typing sim, jitter |
-| **AI agent support** | None | **30 MCP tools** for Claude Code, etc. |
+| **AI agent support** | None | **33 MCP tools** for Claude Code, etc. |
 
 ---
 
@@ -92,17 +92,17 @@ src/
   read_receipts.rs   Batched receipt scheduler
   qr.rs              QR rendering (terminal/PNG/HTML/SVG)
   instance_lock.rs   flock-based single-instance guard
-  main.rs            Daemon (REPL) + CLI (54 commands) + MCP mode
+  main.rs            Daemon (REPL) + CLI (57 commands) + MCP mode
   lib.rs             Library crate exports
 ```
 
-~11,000 lines across 13 files. Built on [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) (v0.5.0, MIT) for the protocol layer.
+~12,000 lines across 15 files. Built on [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) (v0.5.0, MIT) for the protocol layer.
 
 ### Four ways to run it
 
 | Mode | How |
 |------|-----|
-| **Daemon** | `cargo run` -- REPL with 54 commands |
+| **Daemon** | `cargo run` -- REPL with 57 commands |
 | **CLI** | `whatsrust send 15551234567 "Hello"` -- JSON to stdout |
 | **Library** | `WhatsAppBridge::start(config, tx, cancel)` -- embed in your Rust app |
 | **MCP server** | `whatsrust mcp` -- 30 tools for AI agents (Claude Code, etc.) |
@@ -185,7 +185,7 @@ Output:
 
 ## API
 
-54 REST endpoints on `localhost:7270`. JSON in, JSON out. No framework -- raw TCP for minimal overhead.
+58 REST endpoints on `localhost:7270`. JSON in, JSON out. No framework -- raw TCP for minimal overhead.
 
 ### Messaging
 
@@ -309,3 +309,4 @@ Built by [Boris Djordjevic](https://github.com/longevityboris) at [199 Biotechno
 [![Follow @longevityboris](https://img.shields.io/badge/Follow_%40longevityboris-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/longevityboris)
 
 </div>
+

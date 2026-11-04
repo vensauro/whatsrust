@@ -4,6 +4,7 @@
 //! All endpoints return JSON. Media endpoints accept local file paths.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -375,6 +376,13 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/status-image") => handle_status_image(bridge, &req.body).await,
         ("POST", "/api/status-video") => handle_status_video(bridge, &req.body).await,
         ("POST", "/api/status-revoke") => handle_status_revoke(bridge, &req.body).await,
+        // File downloads & media
+        ("POST", "/api/download") => handle_download(bridge, &req.body).await,
+        ("GET", "/api/download") => handle_download_get(bridge, req).await,
+
+        // Audio transcription (queued, single-worker)
+        ("POST", "/api/transcribe") => handle_transcribe(bridge, &req.body).await,
+        ("GET", "/api/transcribe/status") => handle_transcribe_status(bridge, req).await,
 
         _ => json_err(404, "not found"),
     }
@@ -1576,5 +1584,136 @@ mod tests {
         assert!(frame.contains("\"sender_raw\":\"15551234567@s.whatsapp.net\""));
         assert!(frame.contains("\"sequence\":7"));
         assert!(frame.contains("\"content\":{\"type\":\"text\",\"body\":\"hello\",\"link_preview\":null}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Download & Transcription Handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DownloadReq {
+    message_id: Option<String>,
+    url: Option<String>,
+    output_path: Option<String>,
+    #[serde(default)]
+    include_base64: bool,
+}
+
+async fn handle_download(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: DownloadReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    match crate::download::download_file(
+        bridge,
+        req.message_id.as_deref(),
+        req.url.as_deref(),
+        req.output_path.as_deref(),
+        req.include_base64,
+    ).await {
+        Ok(info) => json_ok(serde_json::to_value(info).unwrap_or_else(|_| json!({"status": "ok"}))),
+        Err(e) => json_err(400, &format!("download failed: {e}")),
+    }
+}
+
+async fn handle_download_get(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    let message_id = req.query_get("message_id");
+    let url = req.query_get("url");
+    let output_path = req.query_get("output_path");
+    let include_base64 = req.query_get("include_base64") == Some("true");
+
+    match crate::download::download_file(bridge, message_id, url, output_path, include_base64).await {
+        Ok(info) => json_ok(serde_json::to_value(info).unwrap_or_else(|_| json!({"status": "ok"}))),
+        Err(e) => json_err(400, &format!("download failed: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct TranscribeReq {
+    message_id: Option<String>,
+    path: Option<String>,
+    url: Option<String>,
+    language: Option<String>,
+    prompt: Option<String>,
+    model: Option<String>,
+    temperature: Option<f32>,
+    #[serde(default)]
+    #[serde(rename = "async")]
+    is_async: bool,
+}
+
+async fn handle_transcribe(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: TranscribeReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    // Resolve audio path from message_id, path, or url
+    let audio_path = if let Some(ref p) = req.path {
+        let pb = PathBuf::from(p);
+        if !pb.exists() {
+            return json_err(400, &format!("audio file not found: {p}"));
+        }
+        pb
+    } else if let Some(ref mid) = req.message_id {
+        match crate::download::download_from_message(bridge, mid, None, false).await {
+            Ok(dl) => PathBuf::from(dl.path),
+            Err(e) => return json_err(400, &format!("failed resolving message audio: {e}")),
+        }
+    } else if let Some(ref u) = req.url {
+        match crate::download::download_from_url(u, None, false) {
+            Ok(dl) => PathBuf::from(dl.path),
+            Err(e) => return json_err(400, &format!("failed downloading audio from URL: {e}")),
+        }
+    } else {
+        return json_err(400, "provide one of 'message_id', 'path', or 'url'");
+    };
+
+    let options = crate::transcribe::TranscriptionOptions {
+        language: req.language,
+        prompt: req.prompt,
+        model: req.model,
+        temperature: req.temperature,
+    };
+
+    let queue = bridge.transcription_queue();
+
+    if req.is_async {
+        match queue.enqueue(audio_path, options).await {
+            Ok(job_id) => json_ok(json!({
+                "job_id": job_id,
+                "status": "queued",
+                "message": "job enqueued for transcription",
+            })),
+            Err(e) => json_err(500, &format!("failed to enqueue transcription: {e}")),
+        }
+    } else {
+        // Wait up to 120s for queued single-worker transcription to complete
+        match queue.enqueue_and_wait(audio_path, options, Duration::from_secs(120)).await {
+            Ok(res) => json_ok(serde_json::to_value(res).unwrap()),
+            Err(e) => json_err(500, &format!("transcription failed: {e}")),
+        }
+    }
+}
+
+async fn handle_transcribe_status(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    let queue = bridge.transcription_queue();
+    if let Some(id) = req.query_get("id") {
+        match queue.get_job_status(id) {
+            Some(status) => json_ok(json!({
+                "job_id": id,
+                "status_info": status,
+            })),
+            None => json_err(404, &format!("job '{id}' not found")),
+        }
+    } else {
+        let overview = queue.overview();
+        let recent = queue.recent_jobs();
+        json_ok(json!({
+            "overview": overview,
+            "recent_jobs": recent,
+        }))
     }
 }

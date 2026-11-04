@@ -19,6 +19,8 @@ mod polls;
 pub mod qr;
 mod read_receipts;
 mod storage;
+mod download;
+mod transcribe;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1493,6 +1495,9 @@ fn print_cli_help() {
     println!("  whatsrust location <jid> <lat> <lon>   Send location pin");
     println!("  whatsrust contact <jid> <name> <phone> Send contact card");
     println!("  whatsrust forward <jid> <msg_id>       Forward a cached message");
+    println!("  whatsrust download <msg_id_or_url> [dest] Download media or URL file to disk");
+    println!("  whatsrust transcribe <msg_id_or_path>     Transcribe audio with Whisper (queued)");
+    println!("  whatsrust transcribe-status [job_id]      Check Whisper queue or job status");
     println!("  whatsrust poll <jid> <N> <Q> -- <opts> Create poll (N=selectable)");
     println!("  whatsrust vo-image <jid> <path> [cap]  Send view-once image");
     println!("  whatsrust vo-video <jid> <path> [cap]  Send view-once video");

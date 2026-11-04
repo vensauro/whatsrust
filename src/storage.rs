@@ -199,6 +199,7 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     message_id TEXT NOT NULL UNIQUE,
     content_kind TEXT NOT NULL,
     body_text TEXT,
+    media_path TEXT,
     timestamp INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
@@ -212,7 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, tim
 CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -252,6 +253,8 @@ pub struct InboundRow {
     pub content_kind: String,
     pub body_text: Option<String>,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_path: Option<String>,
 }
 
 /// Statistics from a prune operation.
@@ -547,18 +550,20 @@ impl Store {
         content_kind: &str,
         body_text: Option<&str>,
         timestamp: i64,
+        media_path: Option<&str>,
     ) -> Result<()> {
         let cj = chat_jid.to_owned();
         let sj = sender_jid.to_owned();
         let mid = message_id.to_owned();
         let ck = content_kind.to_owned();
         let bt = body_text.map(|s| s.to_owned());
+        let mp = media_path.map(|s| s.to_owned());
         let ts = now_secs();
         self.run(move |c| {
             c.execute(
-                "INSERT OR IGNORE INTO inbound_messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![cj, sj, mid, ck, bt, timestamp, ts],
+                "INSERT OR IGNORE INTO inbound_messages (chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, media_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![cj, sj, mid, ck, bt, timestamp, mp, ts],
             )
             .map_err(db_err)?;
             Ok(())
@@ -579,7 +584,7 @@ impl Store {
         let before = before_ts.unwrap_or(i64::MAX);
         self.run(move |c| {
             let mut sql = String::from(
-                "SELECT id, chat_jid, sender_jid, message_id, content_kind, body_text, timestamp
+                "SELECT id, chat_jid, sender_jid, message_id, content_kind, body_text, timestamp, media_path
                  FROM inbound_messages WHERE timestamp < ?1"
             );
             let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(before)];
@@ -605,6 +610,7 @@ impl Store {
                     content_kind: row.get(4)?,
                     body_text: row.get(5)?,
                     timestamp: row.get(6)?,
+                    media_path: row.get(7)?,
                 })
             }).map_err(db_err)?;
             rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
@@ -895,6 +901,7 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
                     message_id TEXT NOT NULL UNIQUE,
                     content_kind TEXT NOT NULL,
                     body_text TEXT,
+    media_path TEXT,
                     timestamp INTEGER NOT NULL,
                     created_at INTEGER NOT NULL
                 );
@@ -945,6 +952,17 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
             };
             add_dev_col("next_pre_key_id", "INTEGER NOT NULL DEFAULT 0")?;
             add_dev_col("nct_salt", "BLOB")?;
+        }
+
+        if from_version < 8 {
+            let col_exists: bool = conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('inbound_messages') WHERE name='media_path'")
+                .and_then(|mut s| s.query_row([], |r| r.get::<_, i64>(0)))
+                .unwrap_or(0) > 0;
+            if !col_exists {
+                conn.execute_batch("ALTER TABLE inbound_messages ADD COLUMN media_path TEXT;")
+                    .map_err(db_err)?;
+            }
         }
 
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)

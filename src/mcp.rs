@@ -245,6 +245,27 @@ fn tool_definitions() -> Vec<Value> {
                 "message_id":{"type":"string","description":"ID returned when status was posted"},
                 "privacy":{"type":"string"}
             },"required":["recipients","message_id"]})),
+        tool_def("whatsrust_download_file", "Download a media file from a WhatsApp message or external URL to local disk",
+            json!({"type":"object","properties":{
+                "message_id":{"type":"string","description":"WhatsApp message ID containing media to download (audio, image, video, document)"},
+                "url":{"type":"string","description":"External HTTP/HTTPS URL to download a file from"},
+                "output_path":{"type":"string","description":"Optional local output file or directory path (defaults to downloads/)"},
+                "include_base64":{"type":"boolean","description":"Whether to include base64 file data in the response (default false)"}
+            }})),
+        tool_def("whatsrust_transcribe", "Transcribe audio using Whisper via a strictly sequential single-worker queue (one per time)",
+            json!({"type":"object","properties":{
+                "message_id":{"type":"string","description":"WhatsApp message ID containing an audio/voice note to transcribe"},
+                "path":{"type":"string","description":"Local path to an audio file (.ogg, .mp3, .wav, .m4a)"},
+                "url":{"type":"string","description":"URL of an audio file to download and transcribe"},
+                "language":{"type":"string","description":"Optional language code (e.g. 'en', 'pt', 'es')"},
+                "prompt":{"type":"string","description":"Optional prompt to guide vocabulary or formatting"},
+                "model":{"type":"string","description":"Model name (e.g. 'whisper-1' for API, or model path for local CLI)"},
+                "async":{"type":"boolean","description":"If true, returns immediately with job ID without waiting for completion (default false)"}
+            }})),
+        tool_def("whatsrust_transcribe_status", "Check the status of a Whisper transcription job or queue overview",
+            json!({"type":"object","properties":{
+                "job_id":{"type":"string","description":"Transcription job ID to check status for (optional; if omitted, returns queue overview)"}
+            }})),
     ]
 }
 
@@ -301,6 +322,16 @@ fn call_tool(name: &str, args: &Value, port: u16) -> Value {
         "whatsrust_status_image" => http_post(port, "/api/status-image", args),
         "whatsrust_status_video" => http_post(port, "/api/status-video", args),
         "whatsrust_status_revoke" => http_post(port, "/api/status-revoke", args),
+        "whatsrust_download_file" => http_post(port, "/api/download", args),
+        "whatsrust_transcribe" => http_post(port, "/api/transcribe", args),
+        "whatsrust_transcribe_status" => {
+            let job_id = args.get("job_id").and_then(|v| v.as_str());
+            let url = match job_id {
+                Some(id) => format!("/api/transcribe/status?id={id}"),
+                None => "/api/transcribe/status".to_string(),
+            };
+            http_get(port, &url)
+        }
         _ => Err(format!("unknown tool: {name}")),
     };
 
@@ -388,5 +419,22 @@ fn mcp_connect_host() -> String {
         "127.0.0.1".to_string()
     } else {
         bind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mcp_tool_definitions_include_download_and_transcribe() {
+        let tools = tool_definitions();
+        let names: Vec<&str> = tools.iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+
+        assert!(names.contains(&"whatsrust_download_file"), "missing whatsrust_download_file tool");
+        assert!(names.contains(&"whatsrust_transcribe"), "missing whatsrust_transcribe tool");
+        assert!(names.contains(&"whatsrust_transcribe_status"), "missing whatsrust_transcribe_status tool");
     }
 }

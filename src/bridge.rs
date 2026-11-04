@@ -803,6 +803,7 @@ pub struct WhatsAppBridge {
     event_tx: tokio::sync::broadcast::Sender<Arc<crate::bridge_events::BridgeEvent>>,
     /// Cached group metadata (TTL-based, invalidated on group mutation).
     group_cache: GroupCacheHandle,
+    transcription_queue: Arc<crate::transcribe::TranscriptionQueue>,
 }
 
 impl WhatsAppBridge {
@@ -840,6 +841,7 @@ impl WhatsAppBridge {
         let et = event_tx.clone();
         let st = store.clone();
         let gc = group_cache.clone();
+        let transcription_queue = Arc::new(crate::transcribe::TranscriptionQueue::new());
         tokio::spawn(async move {
             if let Err(e) =
                 run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et, st, gc).await
@@ -862,6 +864,7 @@ impl WhatsAppBridge {
             subscribed_presence,
             event_tx,
             group_cache,
+            transcription_queue,
         }
     }
 
@@ -1236,6 +1239,70 @@ impl WhatsAppBridge {
     /// Get the current QR code data (None if already paired or not yet generated).
     pub fn current_qr(&self) -> Option<String> {
         self.qr_rx.borrow().clone()
+    }
+
+    pub fn transcription_queue(&self) -> &Arc<crate::transcribe::TranscriptionQueue> {
+        &self.transcription_queue
+    }
+
+    /// Download media bytes and suggested filename for a cached message.
+    pub async fn download_media_for_message(&self, msg_id: &str) -> Result<(Vec<u8>, String, String)> {
+        let msg = {
+            let cache = self.msg_cache.lock();
+            cache.get(msg_id).cloned()
+        }.context("message not in cache (only recent messages can be re-downloaded)")?;
+
+        let client = self.client_handle.lock().clone()
+            .context("bridge client is not connected")?;
+
+        if let Some(ref img) = msg.image_message {
+            let mime = img.mimetype.clone().unwrap_or_else(|| "image/jpeg".to_string());
+            let data = client.download(img.as_ref() as &dyn Downloadable).await
+                .map_err(|e| anyhow::anyhow!("failed to download image: {e}"))?;
+            let ext = crate::download::extension_for_mime(&mime).unwrap_or("jpg");
+            return Ok((data, mime, format!("{msg_id}.{ext}")));
+        }
+        if let Some(vid) = msg.video_message.as_deref().or(msg.ptv_message.as_deref()) {
+            let mime = vid.mimetype.clone().unwrap_or_else(|| "video/mp4".to_string());
+            let data = client.download(vid as &dyn Downloadable).await
+                .map_err(|e| anyhow::anyhow!("failed to download video: {e}"))?;
+            let ext = crate::download::extension_for_mime(&mime).unwrap_or("mp4");
+            return Ok((data, mime, format!("{msg_id}.{ext}")));
+        }
+        if let Some(ref aud) = msg.audio_message {
+            let mime = aud.mimetype.clone().unwrap_or_else(|| "audio/ogg".to_string());
+            let data = client.download(aud.as_ref() as &dyn Downloadable).await
+                .map_err(|e| anyhow::anyhow!("failed to download audio: {e}"))?;
+            let ext = crate::download::extension_for_mime(&mime).unwrap_or("ogg");
+            return Ok((data, mime, format!("{msg_id}.{ext}")));
+        }
+        if let Some(ref doc) = msg.document_message {
+            let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
+            let filename = doc.file_name.clone().unwrap_or_else(|| format!("{msg_id}.bin"));
+            let data = client.download(doc.as_ref() as &dyn Downloadable).await
+                .map_err(|e| anyhow::anyhow!("failed to download document: {e}"))?;
+            return Ok((data, mime, filename));
+        }
+        if let Some(ref dwc) = msg.document_with_caption_message {
+            if let Some(ref inner) = dwc.message {
+                if let Some(ref doc) = inner.document_message {
+                    let mime = doc.mimetype.clone().unwrap_or_else(|| "application/octet-stream".to_string());
+                    let filename = doc.file_name.clone().unwrap_or_else(|| format!("{msg_id}.bin"));
+                    let data = client.download(doc.as_ref() as &dyn Downloadable).await
+                        .map_err(|e| anyhow::anyhow!("failed to download document: {e}"))?;
+                    return Ok((data, mime, filename));
+                }
+            }
+        }
+        if let Some(ref stk) = msg.sticker_message {
+            let mime = stk.mimetype.clone().unwrap_or_else(|| "image/webp".to_string());
+            let data = client.download(stk.as_ref() as &dyn Downloadable).await
+                .map_err(|e| anyhow::anyhow!("failed to download sticker: {e}"))?;
+            let ext = crate::download::extension_for_mime(&mime).unwrap_or("webp");
+            return Ok((data, mime, format!("{msg_id}.{ext}")));
+        }
+
+        anyhow::bail!("message {msg_id} does not contain downloadable media")
     }
 
     pub fn is_connected(&self) -> bool {
@@ -2514,12 +2581,13 @@ async fn handle_event(
                         flags: ctx_meta.flags,
                     };
 
+                    let media_path = crate::download::auto_save_inbound_media(&inbound.id, &inbound.content);
                     // Persist to history table for search/context
                     let body_text = inbound.content.display_text();
                     let body_opt = if body_text.is_empty() { None } else { Some(body_text.as_str()) };
                     if let Err(e) = store.insert_inbound(
                         &inbound.jid, &inbound.sender, &inbound.id,
-                        inbound.content.kind(), body_opt, inbound.timestamp,
+                        inbound.content.kind(), body_opt, inbound.timestamp, media_path.as_deref(),
                     ).await {
                         debug!(error = %e, "failed to insert inbound history (may be duplicate)");
                     }

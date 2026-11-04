@@ -33,10 +33,11 @@ rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 sha2 = "0.10"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std", "fs", "process"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = "3"
 
 # whatsapp-rust — 199-biotechnologies fork, rev-pinned
 # We skip the default sqlite-storage feature to avoid Diesel/libsqlite3-sys conflicts.
