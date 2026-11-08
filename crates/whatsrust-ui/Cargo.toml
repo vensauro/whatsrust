@@ -1,0 +1,17 @@
+[package]
+name = "whatsrust-ui"
+version = "0.1.0"
+edition = "2021"
+description = "GPUI desktop interface for WhatsRust AI message triage, WhatsApp tag filtering, and CLI agent routing"
+
+[[bin]]
+name = "whatsrust-ui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+gpui = "0.2.2"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"

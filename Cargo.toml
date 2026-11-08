@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/whatsrust-ui"]
+
 [package]
 name = "whatsrust"
 version = "0.3.0"
@@ -35,6 +38,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std", "fs", "process"] }
 tokio-util = "0.7"
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "3"
