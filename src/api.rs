@@ -384,6 +384,18 @@ async fn handle_request(bridge: &WhatsAppBridge, req: &HttpRequest, is_loopback:
         ("POST", "/api/transcribe") => handle_transcribe(bridge, &req.body).await,
         ("GET", "/api/transcribe/status") => handle_transcribe_status(bridge, req).await,
 
+        // Labels / Tags & AI Triage
+        ("GET", "/api/labels") => handle_labels_list(bridge, req).await,
+        ("POST", "/api/labels/assign") => handle_label_assign(bridge, &req.body).await,
+        ("GET", "/api/triage") => handle_triage_list(bridge, req).await,
+        ("POST", "/api/triage/retriage") => handle_triage_retriage(bridge, &req.body).await,
+        ("POST", "/api/triage/run-agent") => handle_triage_run_agent(bridge, &req.body).await,
+        ("POST", "/api/triage/approve") => handle_triage_approve(bridge, &req.body).await,
+        ("POST", "/api/triage/dismiss") => handle_triage_dismiss(bridge, &req.body).await,
+        ("GET", "/api/triage/config") => handle_triage_config_get(bridge),
+        ("POST", "/api/triage/config") => handle_triage_config_update(bridge, &req.body).await,
+        ("POST", "/api/triage/simulate") => handle_triage_simulate(bridge, &req.body).await,
+
         _ => json_err(404, "not found"),
     }
 }
@@ -1264,6 +1276,16 @@ fn format_sse_event(event: &crate::bridge_events::BridgeEvent) -> Option<String>
             );
             Some(format_sse_frame("status", Some(&event_id), &data))
         }
+        crate::bridge_events::BridgeEvent::LabelUpdate(lbl) => {
+            let data = serde_json::to_string(lbl).ok()?;
+            let event_id = format!("label:{}", lbl.label_id);
+            Some(format_sse_frame("label_update", Some(&event_id), &data))
+        }
+        crate::bridge_events::BridgeEvent::TriageUpdate(triage) => {
+            let data = serde_json::to_string(triage.as_ref()).ok()?;
+            let event_id = format!("triage:{}:{}", triage.chat_jid, triage.updated_at);
+            Some(format_sse_frame("triage_update", Some(&event_id), &data))
+        }
         crate::bridge_events::BridgeEvent::Heartbeat => {
             Some(format_sse_frame("heartbeat", None, "{}"))
         }
@@ -1715,5 +1737,285 @@ async fn handle_transcribe_status(bridge: &WhatsAppBridge, req: &HttpRequest) ->
             "overview": overview,
             "recent_jobs": recent,
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Labels / Tags & AI Triage API handlers
+// ---------------------------------------------------------------------------
+
+fn normalize_jid(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.contains('@') {
+        trimmed.to_string()
+    } else {
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("{digits}@s.whatsapp.net")
+        }
+    }
+}
+
+async fn handle_labels_list(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    if let Some(jid) = req.query_get("jid") {
+        let jid = normalize_jid(jid);
+        match bridge.store().get_chat_labels(&jid).await {
+            Ok(labels) => json_ok(json!({ "jid": jid, "labels": labels })),
+            Err(e) => json_err(500, &format!("failed to query chat labels: {e}")),
+        }
+    } else {
+        match bridge.store().list_all_labels().await {
+            Ok(labels) => json_ok(json!({ "labels": labels })),
+            Err(e) => json_err(500, &format!("failed to list labels: {e}")),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LabelAssignReq {
+    jid: String,
+    tag: String,
+    color: Option<i32>,
+    #[serde(default = "default_true_api")]
+    labeled: bool,
+}
+
+fn default_true_api() -> bool {
+    true
+}
+
+async fn handle_label_assign(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: LabelAssignReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let jid = normalize_jid(&req.jid);
+    match bridge
+        .triage_engine()
+        .assign_chat_tag(&jid, &req.tag, req.color, req.labeled)
+        .await
+    {
+        Ok(labels) => json_ok(json!({ "jid": jid, "labels": labels })),
+        Err(e) => json_err(500, &format!("failed to assign label: {e}")),
+    }
+}
+
+async fn handle_triage_list(bridge: &WhatsAppBridge, req: &HttpRequest) -> Vec<u8> {
+    if let Some(jid) = req.query_get("jid") {
+        let jid = normalize_jid(jid);
+        match bridge.store().get_chat_triage(&jid).await {
+            Ok(Some(row)) => json_ok(json!({ "triage": row })),
+            Ok(None) => json_err(404, "no triage entry for chat"),
+            Err(e) => json_err(500, &format!("failed to fetch chat triage: {e}")),
+        }
+    } else {
+        match bridge.store().list_chat_triages().await {
+            Ok(items) => json_ok(json!({ "items": items })),
+            Err(e) => json_err(500, &format!("failed to list chat triages: {e}")),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct TriageJidReq {
+    jid: String,
+}
+
+async fn handle_triage_retriage(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: TriageJidReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let jid = normalize_jid(&req.jid);
+    match bridge.triage_engine().triage_chat_now(&jid).await {
+        Ok(row) => json_ok(json!({ "triage": row })),
+        Err(e) => json_err(500, &format!("retriage failed: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct RunAgentReq {
+    jid: String,
+    agent_id: Option<String>,
+    prompt: Option<String>,
+}
+
+async fn handle_triage_run_agent(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: RunAgentReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let jid = normalize_jid(&req.jid);
+    match bridge
+        .triage_engine()
+        .run_cli_agent(&jid, req.agent_id.as_deref(), req.prompt.as_deref())
+        .await
+    {
+        Ok(row) => json_ok(json!({ "triage": row })),
+        Err(e) => json_err(500, &format!("CLI agent execution failed: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct ApproveDraftReq {
+    jid: String,
+    text: Option<String>,
+}
+
+async fn handle_triage_approve(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: ApproveDraftReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let jid = normalize_jid(&req.jid);
+    let current = match bridge.store().get_chat_triage(&jid).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return json_err(404, "no triage entry found for chat"),
+        Err(e) => return json_err(500, &format!("store error: {e}")),
+    };
+
+    let reply_text = req
+        .text
+        .or(current.agent_draft.clone())
+        .unwrap_or_default();
+    if reply_text.trim().is_empty() {
+        return json_err(400, "draft reply text is empty");
+    }
+
+    if let Err(e) = bridge.send_message(&jid, &reply_text).await {
+        return bridge_err(e);
+    }
+
+    match bridge
+        .store()
+        .update_agent_status(&jid, "sent", Some(&reply_text), None)
+        .await
+    {
+        Ok(Some(updated)) => {
+            let _ = bridge.event_sender().send(Arc::new(
+                crate::bridge_events::BridgeEvent::TriageUpdate(Box::new(updated.clone())),
+            ));
+            json_ok(json!({ "triage": updated, "sent_text": reply_text }))
+        }
+        Ok(None) => json_err(404, "triage entry missing after update"),
+        Err(e) => json_err(500, &format!("failed to mark draft sent: {e}")),
+    }
+}
+
+async fn handle_triage_dismiss(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: TriageJidReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let jid = normalize_jid(&req.jid);
+    match bridge
+        .store()
+        .update_agent_status(&jid, "dismissed", None, None)
+        .await
+    {
+        Ok(Some(updated)) => {
+            let _ = bridge.event_sender().send(Arc::new(
+                crate::bridge_events::BridgeEvent::TriageUpdate(Box::new(updated.clone())),
+            ));
+            json_ok(json!({ "triage": updated }))
+        }
+        Ok(None) => json_err(404, "no triage entry found"),
+        Err(e) => json_err(500, &format!("failed to dismiss triage: {e}")),
+    }
+}
+
+fn handle_triage_config_get(bridge: &WhatsAppBridge) -> Vec<u8> {
+    let cfg = bridge.triage_engine().config();
+    json_ok(json!({ "config": cfg }))
+}
+
+#[derive(Deserialize)]
+struct UpdateTriageConfigReq {
+    #[serde(default)]
+    reload: bool,
+    include_all_dms: Option<bool>,
+    filter_tags: Option<Vec<String>>,
+}
+
+async fn handle_triage_config_update(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: UpdateTriageConfigReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let res = if req.reload {
+        bridge.triage_engine().reload_config().await
+    } else {
+        bridge
+            .triage_engine()
+            .update_filter_settings(req.include_all_dms, req.filter_tags)
+            .await
+    };
+    match res {
+        Ok(cfg) => json_ok(json!({ "config": cfg })),
+        Err(e) => json_err(500, &format!("failed to update triage config: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct SimulateInboundReq {
+    jid: String,
+    sender_name: Option<String>,
+    text: String,
+    tag: Option<String>,
+}
+
+async fn handle_triage_simulate(bridge: &WhatsAppBridge, body: &[u8]) -> Vec<u8> {
+    let req: SimulateInboundReq = match parse_body(body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let jid = normalize_jid(&req.jid);
+    if let Some(ref tag) = req.tag {
+        let _ = bridge
+            .triage_engine()
+            .assign_chat_tag(&jid, tag, Some(2), true)
+            .await;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let msg_id = format!("SIM-{ts}");
+    let _ = bridge
+        .store()
+        .insert_inbound(&jid, &jid, &msg_id, "text", Some(&req.text), ts, None)
+        .await;
+
+    let inbound = crate::bridge::WhatsAppInbound {
+        sequence: ts as u64,
+        bridge_id: "default".into(),
+        jid: jid.clone(),
+        id: msg_id,
+        content: crate::bridge::InboundContent::Text {
+            body: req.text,
+            link_preview: None,
+        },
+        sender: jid.clone(),
+        sender_raw: jid.clone(),
+        push_name: req.sender_name.unwrap_or_else(|| "Simulated Contact".into()),
+        timestamp: ts,
+        reply_to: None,
+        is_from_me: false,
+        is_group: jid.ends_with("@g.us"),
+        mentions: vec![],
+        ephemeral_expiration: None,
+        flags: crate::bridge::MessageFlags::default(),
+    };
+    let _ = bridge
+        .event_sender()
+        .send(Arc::new(crate::bridge_events::BridgeEvent::Inbound(Arc::new(
+            inbound,
+        ))));
+
+    match bridge.triage_engine().triage_chat_now(&jid).await {
+        Ok(row) => json_ok(json!({ "triage": row })),
+        Err(e) => json_err(500, &format!("simulation triage failed: {e}")),
     }
 }
