@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::bridge::WhatsAppInbound;
+use crate::storage::{ChatTriageRow, LabelRow};
 
 /// Capacity of the broadcast channel. Slow receivers that fall behind
 /// this many events will get `Lagged` and should reconnect.
@@ -26,8 +27,21 @@ pub enum BridgeEvent {
     Inbound(Arc<WhatsAppInbound>),
     /// Status change for an outbound job (queued → sending → sent → delivered → read).
     OutboundStatus(OutboundStatusEvent),
+    /// WhatsApp or local label/tag definition or chat association changed.
+    LabelUpdate(LabelUpdateEvent),
+    /// AI triage or CLI subprocess agent state updated for a chat.
+    TriageUpdate(Box<ChatTriageRow>),
     /// Periodic heartbeat for keepalive (SSE clients).
     Heartbeat,
+}
+
+/// Event emitted when a label definition or chat-label association changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelUpdateEvent {
+    pub label_id: String,
+    pub chat_jid: Option<String>,
+    pub labeled: Option<bool>,
+    pub label: Option<LabelRow>,
 }
 
 /// Status update for an outbound job.

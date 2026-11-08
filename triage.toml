@@ -1,0 +1,40 @@
+[triage]
+enabled = true
+debounce_ms = 2500
+auto_transcribe_voice = true
+filter_tags = ["Work", "Clients", "Urgent", "Dev"]
+include_all_dms = false
+
+[llm]
+# Google Gemini OpenAI-compatible endpoint (reads OPENAI_API_KEY from .env)
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "OPENAI_API_KEY"
+model = "gemini-3-flash-preview"
+
+[[projects]]
+id = "whatsrust"
+name = "WhatsRust Bridge & GPUI"
+workdir = "C:/Users/Ivens Joris/Documents/codes/whatsrust"
+description = "Pure Rust WhatsApp Web bridge, MCP server, and GPUI desktop triage interface."
+tags = ["Work", "Dev"]
+jids = ["557791229001@s.whatsapp.net", "5577991229001@s.whatsapp.net", "557791229001"]
+keywords = ["whatsrust", "gpui", "whatsapp", "bridge", "rust", "sqlite", "mcp", "whisper"]
+default_agent = "claude-cli"
+
+[[agents]]
+id = "claude-cli"
+name = "Claude Code CLI"
+description = "Spawns Claude Code in headless print mode inside the project directory to answer technical questions or inspect code."
+command = "claude"
+args = ["-p", "{{prompt}}"]
+auto_run = false
+timeout_secs = 120
+
+[[agents]]
+id = "quick-echo"
+name = "Quick Draft Helper (PowerShell)"
+description = "Fast local shell responder for testing subprocess execution in the project directory."
+command = "powershell"
+args = ["-NoProfile", "-Command", "Write-Output \"[Draft for {{project_id}}] Hi {{chat_name}}, checked your message ({{summary}}). Everything is running smoothly!\""]
+auto_run = false
+timeout_secs = 30

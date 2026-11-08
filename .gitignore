@@ -3,8 +3,9 @@
 *.db-shm
 *.db-wal
 *.instance.lock
+.env
+downloads/
 .claude/
 .worktrees/
-.cargo/config.toml
 .DS_Store
 review-pack/

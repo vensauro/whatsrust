@@ -204,6 +204,40 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     created_at INTEGER NOT NULL
 );
 
+-- WhatsApp & local labels/tags
+CREATE TABLE IF NOT EXISTS whatsapp_labels (
+    label_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'whatsapp',
+    updated_at INTEGER NOT NULL
+);
+
+-- Chat-to-label associations
+CREATE TABLE IF NOT EXISTS chat_labels (
+    chat_jid TEXT NOT NULL,
+    label_id TEXT NOT NULL,
+    assigned_at INTEGER NOT NULL,
+    PRIMARY KEY (chat_jid, label_id)
+);
+
+-- Per-chat AI triage & CLI subprocess agent state
+CREATE TABLE IF NOT EXISTS chat_triage (
+    chat_jid TEXT PRIMARY KEY,
+    chat_name TEXT NOT NULL DEFAULT '',
+    last_message_id TEXT NOT NULL DEFAULT '',
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    rolling_summary TEXT NOT NULL DEFAULT '',
+    project_id TEXT,
+    project_confidence REAL NOT NULL DEFAULT 0.0,
+    matched_agent_id TEXT,
+    agent_prompt TEXT,
+    agent_status TEXT NOT NULL DEFAULT 'idle',
+    agent_draft TEXT,
+    agent_error TEXT,
+    updated_at INTEGER NOT NULL
+);
+
 -- Indexes for non-PK lookups
 CREATE INDEX IF NOT EXISTS idx_lid_pn_phone ON lid_pn_mapping(phone_number);
 CREATE INDEX IF NOT EXISTS idx_tc_tokens_ts ON tc_tokens(token_timestamp);
@@ -211,9 +245,11 @@ CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_queue(status, retry_a
 CREATE INDEX IF NOT EXISTS idx_outbound_wa_id ON outbound_queue(wa_message_id);
 CREATE INDEX IF NOT EXISTS idx_inbound_chat_ts ON inbound_messages(chat_jid, timestamp);
 CREATE INDEX IF NOT EXISTS idx_inbound_msg_id ON inbound_messages(message_id);
+CREATE INDEX IF NOT EXISTS idx_chat_labels_jid ON chat_labels(chat_jid);
+CREATE INDEX IF NOT EXISTS idx_chat_triage_updated ON chat_triage(updated_at DESC);
 ";
 
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[cfg(unix)]
 fn secure_backup_permissions(path: &Path) -> Result<()> {
@@ -244,7 +280,7 @@ pub struct Store {
 }
 
 /// A row from the inbound message history table.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InboundRow {
     pub id: i64,
     pub chat_jid: String,
@@ -255,6 +291,36 @@ pub struct InboundRow {
     pub timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_path: Option<String>,
+}
+
+/// A WhatsApp or locally defined chat label/tag.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct LabelRow {
+    pub label_id: String,
+    pub name: String,
+    pub color: i32,
+    pub source: String,
+    pub updated_at: i64,
+}
+
+/// Per-chat AI triage and CLI agent draft state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatTriageRow {
+    pub chat_jid: String,
+    pub chat_name: String,
+    pub last_message_id: String,
+    pub unread_count: i64,
+    pub rolling_summary: String,
+    pub project_id: Option<String>,
+    pub project_confidence: f64,
+    pub matched_agent_id: Option<String>,
+    pub agent_prompt: Option<String>,
+    pub agent_status: String,
+    pub agent_draft: Option<String>,
+    pub agent_error: Option<String>,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub labels: Vec<LabelRow>,
 }
 
 /// Statistics from a prune operation.
@@ -795,6 +861,327 @@ impl Store {
         })
         .await
     }
+
+    /// Update the body text of an inbound message (e.g. after Whisper audio transcription).
+    pub async fn update_inbound_body(&self, message_id: &str, new_body: &str) -> Result<()> {
+        let mid = message_id.to_owned();
+        let body = new_body.to_owned();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE inbound_messages SET body_text = ?1 WHERE message_id = ?2",
+                params![body, mid],
+            )
+            .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Labels / Tags & AI Triage storage
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a WhatsApp or local label definition.
+    pub async fn upsert_label(
+        &self,
+        label_id: &str,
+        name: &str,
+        color: i32,
+        source: &str,
+    ) -> Result<LabelRow> {
+        let lid = label_id.to_owned();
+        let nm = name.to_owned();
+        let src = source.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO whatsapp_labels (label_id, name, color, source, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(label_id) DO UPDATE SET
+                    name = excluded.name,
+                    color = excluded.color,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at",
+                params![lid, nm, color, src, ts],
+            )
+            .map_err(db_err)?;
+            Ok(LabelRow {
+                label_id: lid,
+                name: nm,
+                color,
+                source: src,
+                updated_at: ts,
+            })
+        })
+        .await
+    }
+
+    /// Delete a label definition and all of its chat associations.
+    pub async fn delete_label(&self, label_id: &str) -> Result<()> {
+        let lid = label_id.to_owned();
+        self.run(move |c| {
+            c.execute("DELETE FROM chat_labels WHERE label_id = ?1", params![lid])
+                .map_err(db_err)?;
+            c.execute("DELETE FROM whatsapp_labels WHERE label_id = ?1", params![lid])
+                .map_err(db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Associate or disassociate a label with a chat JID.
+    pub async fn set_chat_label(&self, chat_jid: &str, label_id: &str, labeled: bool) -> Result<()> {
+        let jid = chat_jid.to_owned();
+        let lid = label_id.to_owned();
+        let ts = now_secs();
+        self.run(move |c| {
+            if labeled {
+                c.execute(
+                    "INSERT OR IGNORE INTO whatsapp_labels (label_id, name, color, source, updated_at)
+                     VALUES (?1, ?2, 0, 'whatsapp', ?3)",
+                    params![lid, lid, ts],
+                )
+                .map_err(db_err)?;
+                c.execute(
+                    "INSERT OR REPLACE INTO chat_labels (chat_jid, label_id, assigned_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![jid, lid, ts],
+                )
+                .map_err(db_err)?;
+            } else {
+                c.execute(
+                    "DELETE FROM chat_labels WHERE chat_jid = ?1 AND label_id = ?2",
+                    params![jid, lid],
+                )
+                .map_err(db_err)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Get all labels currently assigned to a chat.
+    pub async fn get_chat_labels(&self, chat_jid: &str) -> Result<Vec<LabelRow>> {
+        let jid = chat_jid.to_owned();
+        self.run(move |c| get_chat_labels_sync(c, &jid)).await
+    }
+
+    /// List all known labels (WhatsApp synced + local).
+    pub async fn list_all_labels(&self) -> Result<Vec<LabelRow>> {
+        self.run(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT label_id, name, color, source, updated_at
+                     FROM whatsapp_labels
+                     ORDER BY name ASC",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(LabelRow {
+                        label_id: r.get(0)?,
+                        name: r.get(1)?,
+                        color: r.get(2)?,
+                        source: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                })
+                .map_err(db_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+        })
+        .await
+    }
+
+    /// Insert or update a chat's AI triage state and return the hydrated row (with labels).
+    pub async fn upsert_chat_triage(&self, row: &ChatTriageRow) -> Result<ChatTriageRow> {
+        let row_clone = row.clone();
+        self.run(move |c| {
+            c.execute(
+                "INSERT INTO chat_triage (
+                    chat_jid, chat_name, last_message_id, unread_count,
+                    rolling_summary, project_id, project_confidence,
+                    matched_agent_id, agent_prompt, agent_status,
+                    agent_draft, agent_error, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(chat_jid) DO UPDATE SET
+                    chat_name = CASE WHEN excluded.chat_name != '' THEN excluded.chat_name ELSE chat_triage.chat_name END,
+                    last_message_id = excluded.last_message_id,
+                    unread_count = excluded.unread_count,
+                    rolling_summary = excluded.rolling_summary,
+                    project_id = excluded.project_id,
+                    project_confidence = excluded.project_confidence,
+                    matched_agent_id = excluded.matched_agent_id,
+                    agent_prompt = excluded.agent_prompt,
+                    agent_status = excluded.agent_status,
+                    agent_draft = excluded.agent_draft,
+                    agent_error = excluded.agent_error,
+                    updated_at = excluded.updated_at",
+                params![
+                    row_clone.chat_jid,
+                    row_clone.chat_name,
+                    row_clone.last_message_id,
+                    row_clone.unread_count,
+                    row_clone.rolling_summary,
+                    row_clone.project_id,
+                    row_clone.project_confidence,
+                    row_clone.matched_agent_id,
+                    row_clone.agent_prompt,
+                    row_clone.agent_status,
+                    row_clone.agent_draft,
+                    row_clone.agent_error,
+                    row_clone.updated_at,
+                ],
+            )
+            .map_err(db_err)?;
+            get_chat_triage_sync(c, &row_clone.chat_jid)?
+                .ok_or_else(|| StoreError::Database("missing chat_triage row after upsert".into()))
+        })
+        .await
+    }
+
+    /// Update the CLI agent execution status/draft/error for a triaged chat.
+    pub async fn update_agent_status(
+        &self,
+        chat_jid: &str,
+        status: &str,
+        draft: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<ChatTriageRow>> {
+        let jid = chat_jid.to_owned();
+        let st = status.to_owned();
+        let dr = draft.map(|s| s.to_owned());
+        let er = error.map(|s| s.to_owned());
+        let ts = now_secs();
+        self.run(move |c| {
+            c.execute(
+                "UPDATE chat_triage SET
+                    agent_status = ?1,
+                    agent_draft = COALESCE(?2, agent_draft),
+                    agent_error = ?3,
+                    unread_count = CASE WHEN ?1 = 'sent' OR ?1 = 'dismissed' THEN 0 ELSE unread_count END,
+                    updated_at = ?4
+                 WHERE chat_jid = ?5",
+                params![st, dr, er, ts, jid],
+            )
+            .map_err(db_err)?;
+            get_chat_triage_sync(c, &jid)
+        })
+        .await
+    }
+
+    /// Fetch a single chat's triage record (including its assigned labels).
+    pub async fn get_chat_triage(&self, chat_jid: &str) -> Result<Option<ChatTriageRow>> {
+        let jid = chat_jid.to_owned();
+        self.run(move |c| get_chat_triage_sync(c, &jid)).await
+    }
+
+    /// List all triaged chats ordered by most recently updated.
+    pub async fn list_chat_triages(&self) -> Result<Vec<ChatTriageRow>> {
+        self.run(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT chat_jid, chat_name, last_message_id, unread_count,
+                            rolling_summary, project_id, project_confidence,
+                            matched_agent_id, agent_prompt, agent_status,
+                            agent_draft, agent_error, updated_at
+                     FROM chat_triage
+                     ORDER BY updated_at DESC",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ChatTriageRow {
+                        chat_jid: r.get(0)?,
+                        chat_name: r.get(1)?,
+                        last_message_id: r.get(2)?,
+                        unread_count: r.get(3)?,
+                        rolling_summary: r.get(4)?,
+                        project_id: r.get(5)?,
+                        project_confidence: r.get(6)?,
+                        matched_agent_id: r.get(7)?,
+                        agent_prompt: r.get(8)?,
+                        agent_status: r.get(9)?,
+                        agent_draft: r.get(10)?,
+                        agent_error: r.get(11)?,
+                        updated_at: r.get(12)?,
+                        labels: Vec::new(),
+                    })
+                })
+                .map_err(db_err)?;
+            let mut items = rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            for item in &mut items {
+                item.labels = get_chat_labels_sync(c, &item.chat_jid)?;
+            }
+            Ok(items)
+        })
+        .await
+    }
+}
+
+fn get_chat_labels_sync(conn: &Connection, chat_jid: &str) -> Result<Vec<LabelRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.label_id, l.name, l.color, l.source, l.updated_at
+             FROM chat_labels cl
+             JOIN whatsapp_labels l ON l.label_id = cl.label_id
+             WHERE cl.chat_jid = ?1
+             ORDER BY l.name ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![chat_jid], |r| {
+            Ok(LabelRow {
+                label_id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                source: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })
+        .map_err(db_err)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db_err)
+}
+
+fn get_chat_triage_sync(conn: &Connection, chat_jid: &str) -> Result<Option<ChatTriageRow>> {
+    let row = conn
+        .query_row(
+            "SELECT chat_jid, chat_name, last_message_id, unread_count,
+                    rolling_summary, project_id, project_confidence,
+                    matched_agent_id, agent_prompt, agent_status,
+                    agent_draft, agent_error, updated_at
+             FROM chat_triage
+             WHERE chat_jid = ?1",
+            params![chat_jid],
+            |r| {
+                Ok(ChatTriageRow {
+                    chat_jid: r.get(0)?,
+                    chat_name: r.get(1)?,
+                    last_message_id: r.get(2)?,
+                    unread_count: r.get(3)?,
+                    rolling_summary: r.get(4)?,
+                    project_id: r.get(5)?,
+                    project_confidence: r.get(6)?,
+                    matched_agent_id: r.get(7)?,
+                    agent_prompt: r.get(8)?,
+                    agent_status: r.get(9)?,
+                    agent_draft: r.get(10)?,
+                    agent_error: r.get(11)?,
+                    updated_at: r.get(12)?,
+                    labels: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .map_err(db_err)?;
+    match row {
+        Some(mut item) => {
+            item.labels = get_chat_labels_sync(conn, &item.chat_jid)?;
+            Ok(Some(item))
+        }
+        None => Ok(None),
+    }
 }
 
 fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
@@ -963,6 +1350,42 @@ fn run_schema_migrations(conn: &Connection, from_version: i64) -> Result<()> {
                 conn.execute_batch("ALTER TABLE inbound_messages ADD COLUMN media_path TEXT;")
                     .map_err(db_err)?;
             }
+        }
+
+        if from_version < 9 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS whatsapp_labels (
+                    label_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    color INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'whatsapp',
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS chat_labels (
+                    chat_jid TEXT NOT NULL,
+                    label_id TEXT NOT NULL,
+                    assigned_at INTEGER NOT NULL,
+                    PRIMARY KEY (chat_jid, label_id)
+                );
+                CREATE TABLE IF NOT EXISTS chat_triage (
+                    chat_jid TEXT PRIMARY KEY,
+                    chat_name TEXT NOT NULL DEFAULT '',
+                    last_message_id TEXT NOT NULL DEFAULT '',
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    rolling_summary TEXT NOT NULL DEFAULT '',
+                    project_id TEXT,
+                    project_confidence REAL NOT NULL DEFAULT 0.0,
+                    matched_agent_id TEXT,
+                    agent_prompt TEXT,
+                    agent_status TEXT NOT NULL DEFAULT 'idle',
+                    agent_draft TEXT,
+                    agent_error TEXT,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_labels_jid ON chat_labels(chat_jid);
+                CREATE INDEX IF NOT EXISTS idx_chat_triage_updated ON chat_triage(updated_at DESC);"
+            )
+            .map_err(db_err)?;
         }
 
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
@@ -2036,6 +2459,77 @@ mod tests {
         let backup_path = store.perform_backup(&backup_dir, 3).unwrap();
 
         assert!(backup_path.exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn test_labels_and_chat_triage_crud() {
+        let root = unique_test_dir("triage-crud");
+        let db_path = root.join("whatsapp.db");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let store = Store::new(&db_path).unwrap();
+
+        let lbl = store
+            .upsert_label("lbl_1", "Work", 2, "whatsapp")
+            .await
+            .unwrap();
+        assert_eq!(lbl.name, "Work");
+        assert_eq!(lbl.color, 2);
+
+        store
+            .set_chat_label("5511999999999@s.whatsapp.net", "lbl_1", true)
+            .await
+            .unwrap();
+
+        let chat_labels = store
+            .get_chat_labels("5511999999999@s.whatsapp.net")
+            .await
+            .unwrap();
+        assert_eq!(chat_labels.len(), 1);
+        assert_eq!(chat_labels[0].name, "Work");
+
+        let triage_in = ChatTriageRow {
+            chat_jid: "5511999999999@s.whatsapp.net".into(),
+            chat_name: "Ivens".into(),
+            last_message_id: "MSG_42".into(),
+            unread_count: 3,
+            rolling_summary: "Asking about GPUI label sync".into(),
+            project_id: Some("whatsrust".into()),
+            project_confidence: 0.92,
+            matched_agent_id: Some("claude-cli".into()),
+            agent_prompt: Some("Check label sync".into()),
+            agent_status: "idle".into(),
+            agent_draft: None,
+            agent_error: None,
+            updated_at: 123456,
+            labels: vec![],
+        };
+
+        let saved = store.upsert_chat_triage(&triage_in).await.unwrap();
+        assert_eq!(saved.labels.len(), 1);
+        assert_eq!(saved.labels[0].name, "Work");
+        assert_eq!(saved.project_id.as_deref(), Some("whatsrust"));
+
+        let updated = store
+            .update_agent_status(
+                "5511999999999@s.whatsapp.net",
+                "draft_ready",
+                Some("Yes, GPUI label sync is live!"),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.agent_status, "draft_ready");
+        assert_eq!(
+            updated.agent_draft.as_deref(),
+            Some("Yes, GPUI label sync is live!")
+        );
+
+        let all = store.list_chat_triages().await.unwrap();
+        assert_eq!(all.len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

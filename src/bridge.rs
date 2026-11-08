@@ -804,6 +804,7 @@ pub struct WhatsAppBridge {
     /// Cached group metadata (TTL-based, invalidated on group mutation).
     group_cache: GroupCacheHandle,
     transcription_queue: Arc<crate::transcribe::TranscriptionQueue>,
+    triage_engine: Arc<crate::triage::TriageEngine>,
 }
 
 impl WhatsAppBridge {
@@ -842,6 +843,11 @@ impl WhatsAppBridge {
         let st = store.clone();
         let gc = group_cache.clone();
         let transcription_queue = Arc::new(crate::transcribe::TranscriptionQueue::new());
+        let triage_engine = crate::triage::TriageEngine::start(
+            store.clone(),
+            event_tx.clone(),
+            transcription_queue.clone(),
+        );
         tokio::spawn(async move {
             if let Err(e) =
                 run_bridge(config, inbound_tx, state_tx, qr_tx, cancel_clone, ch, rr, mc, met, sp, sub_pres, on, et, st, gc).await
@@ -865,6 +871,7 @@ impl WhatsAppBridge {
             event_tx,
             group_cache,
             transcription_queue,
+            triage_engine,
         }
     }
 
@@ -1243,6 +1250,10 @@ impl WhatsAppBridge {
 
     pub fn transcription_queue(&self) -> &Arc<crate::transcribe::TranscriptionQueue> {
         &self.transcription_queue
+    }
+
+    pub fn triage_engine(&self) -> &Arc<crate::triage::TriageEngine> {
+        &self.triage_engine
     }
 
     /// Download media bytes and suggested filename for a cached message.
@@ -2949,6 +2960,77 @@ async fn handle_event(
         }
         Event::MarkChatAsReadUpdate(update) => {
             debug!(jid = %update.jid, "chat marked as read/unread");
+        }
+        Event::LabelEditUpdate(update) => {
+            let deleted = update.action.deleted.unwrap_or(false);
+            let name = update
+                .action
+                .name
+                .clone()
+                .unwrap_or_else(|| update.label_id.clone());
+            let color = update.action.color.unwrap_or(0);
+            debug!(
+                label_id = %update.label_id,
+                name = %name,
+                color,
+                deleted,
+                "WhatsApp label definition synced"
+            );
+            let st = store.clone();
+            let et = event_tx.clone();
+            let lid = update.label_id.clone();
+            tokio::spawn(async move {
+                if deleted {
+                    let _ = st.delete_label(&lid).await;
+                    let _ = et.send(Arc::new(crate::bridge_events::BridgeEvent::LabelUpdate(
+                        crate::bridge_events::LabelUpdateEvent {
+                            label_id: lid,
+                            chat_jid: None,
+                            labeled: Some(false),
+                            label: None,
+                        },
+                    )));
+                } else if let Ok(row) = st.upsert_label(&lid, &name, color, "whatsapp").await {
+                    let _ = et.send(Arc::new(crate::bridge_events::BridgeEvent::LabelUpdate(
+                        crate::bridge_events::LabelUpdateEvent {
+                            label_id: lid,
+                            chat_jid: None,
+                            labeled: None,
+                            label: Some(row),
+                        },
+                    )));
+                }
+            });
+        }
+        Event::LabelAssociationUpdate(update) => {
+            let labeled = update.action.labeled.unwrap_or(false);
+            let chat_jid = update.target_jid.to_string();
+            debug!(
+                label_id = %update.label_id,
+                chat_jid = %chat_jid,
+                labeled,
+                "WhatsApp chat label association synced"
+            );
+            let st = store.clone();
+            let et = event_tx.clone();
+            let lid = update.label_id.clone();
+            tokio::spawn(async move {
+                if st.set_chat_label(&chat_jid, &lid, labeled).await.is_ok() {
+                    let _ = et.send(Arc::new(crate::bridge_events::BridgeEvent::LabelUpdate(
+                        crate::bridge_events::LabelUpdateEvent {
+                            label_id: lid,
+                            chat_jid: Some(chat_jid.clone()),
+                            labeled: Some(labeled),
+                            label: None,
+                        },
+                    )));
+                    if let Ok(Some(triage_row)) = st.get_chat_triage(&chat_jid).await {
+                        let _ = et.send(Arc::new(crate::bridge_events::BridgeEvent::TriageUpdate(
+                            Box::new(triage_row),
+                        )));
+                    }
+                }
+            });
         }
         Event::HistorySync(_) => {
             debug!("history sync chunk received (ignored — skip_history_sync active)");

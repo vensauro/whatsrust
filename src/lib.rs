@@ -12,3 +12,4 @@ pub mod qr;
 pub mod read_receipts;
 pub mod storage;
 pub mod transcribe;
+pub mod triage;

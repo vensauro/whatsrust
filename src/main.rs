@@ -21,6 +21,7 @@ mod read_receipts;
 mod storage;
 mod download;
 mod transcribe;
+mod triage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
