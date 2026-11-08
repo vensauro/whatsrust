@@ -1,0 +1,7 @@
+[patch.'https://github.com/199-biotechnologies/whatsapp-rust']
+whatsapp-rust = { path = "vendor/whatsapp-rust" }
+wacore = { path = "vendor/whatsapp-rust/wacore" }
+wacore-binary = { path = "vendor/whatsapp-rust/wacore/binary" }
+waproto = { path = "vendor/whatsapp-rust/waproto" }
+whatsapp-rust-tokio-transport = { path = "vendor/whatsapp-rust/transports/tokio-transport" }
+whatsapp-rust-ureq-http-client = { path = "vendor/whatsapp-rust/http_clients/ureq-client" }
